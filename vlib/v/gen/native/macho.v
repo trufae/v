@@ -149,8 +149,9 @@ fn (mut g Gen) macho_symtab() {
 	g.write32(0) // nmodtab
 	g.write32(0) // extrefsymoff
 	g.write32(0) // nextrefsyms
-	g.write32(0) // indirectsymoff
-	g.write32(0) // nindirectsyms
+	g.plt_addr_hdr = g.buf.len
+	g.write32(g.plt_addr_off) // indirectsymoff
+	g.write32(g.plt_addr.len) // nindirectsyms
 	g.write32(0) // extreloff
 	g.write32(0) // nextrel
 	g.write32(0) // locreloff
@@ -282,10 +283,17 @@ pub fn (mut g Gen) generate_macho_object_header() {
 	}
 }
 
+pub fn (mut g Gen) write_macho_relocs() {
+	g.write32_at(g.plt_addr_hdr, g.plt_addr_off)
+	g.write32_at(g.plt_addr_hdr + 4, g.plt_addr.len)
+	// g.sym_string_table()
+}
+
 pub fn (mut g Gen) generate_macho_footer() {
 	codesize := g.buf.len - 0x1000
 	g.write_relocs()
 	g.sym_table()
+	g.write_macho_relocs()
 	stringtablesize := g.sym_string_table()
 	delta := codesize + stringtablesize + 12 // code_offset_end - 0x1000// + stringtablesize
 	g.write8(0)

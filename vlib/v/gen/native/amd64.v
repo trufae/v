@@ -751,8 +751,16 @@ pub fn (mut g Gen) call_fn(node ast.CallExpr) {
 	if !n.contains('.') {
 		n = 'main.$n'
 	}
-	eprintln('call fn ($n)')
-	addr := g.fn_addr[n]
+	addr := if name.starts_with('C.') {
+		sym := name[2..]
+		if g.plt_addr[sym] == 0 {
+			verror('Error: Calling external C functions is not yet supported')
+		}
+		g.plt_addr[sym] = 1 // pltstub
+		g.plt_addr[sym]
+	} else {
+		g.fn_addr[n]
+	}
 	if addr == 0 {
 		verror('fn addr of `$name` = 0')
 	}
@@ -1156,6 +1164,15 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 		// `mov DWORD PTR [rbp-0x4],edi`
 		offset += 4
 		g.mov_reg_to_var(offset, native.fn_arg_registers[i])
+	}
+	if node.stmts.len == 0 {
+		if node.name.starts_with('C.') {
+			// register import in the plt
+			plt_base := 0x10000
+			sym := node.name[2..]
+			g.plt_addr[sym] = plt_base + (32 * g.plt_addr.keys().len)
+			eprintln('Registering fake plt entry for $sym')
+		}
 	}
 	//
 	g.stmts(node.stmts)
