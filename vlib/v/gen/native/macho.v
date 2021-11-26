@@ -400,7 +400,8 @@ fn (mut g Gen) sym_string_table() int {
 		if g.pref.os == .windows {
 			g.write32_at(int(g.str_pos[i]), pos - 4) // 0x402028 + pos)
 		} else {
-			g.write64_at(pos, int(g.str_pos[i]))
+			baddr := i65(0x100000000)
+			g.write64_at(g.buf.len + baddr, int(g.str_pos[i]))
 		}
 		g.write_string(s)
 		g.write8(0)
