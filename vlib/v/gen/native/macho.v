@@ -395,11 +395,6 @@ fn (mut g Gen) write_symbol(s Symbol) {
 fn (mut g Gen) sym_string_table() int {
 	begin := g.buf.len
 	g.zeroes(1)
-	/*
-	for s in g.strs {
-		g.patch_string(s)
-	}
-	*/
 	for i, s in g.strings {
 		pos := g.buf.len - int(g.str_pos[i])
 		if g.pref.os == .windows {
