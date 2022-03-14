@@ -34,6 +34,8 @@ mut:
 	offset               i64
 	stackframe_size      int
 	file_size_pos        i64
+	entry_pos64          i64
+	phnum_pos            i64
 	main_fn_addr         i64
 	code_start_pos       i64 // location of the start of the assembly instructions
 	fn_addr              map[string]i64
@@ -44,12 +46,14 @@ mut:
 	warnings             []errors.Warning
 	syms                 []Symbol
 	size_pos             []int
+	interp_pos           i64
 	nlines               int
 	callpatches          []CallPatch
 	strs                 []String
 }
 
 enum RelocType {
+	nop
 	rel8
 	rel16
 	rel32

@@ -33,6 +33,7 @@ const (
 const (
 	segment_start = 0x400000
 	placeholder   = 0
+	want_interp   = false
 )
 
 /*
@@ -71,17 +72,25 @@ pub fn (mut g Gen) generate_elf_header() {
 		g.write16(native.elf_amd64)
 	}
 	g.write32(native.elf_version)
-	g.write64(native.segment_start + native.elf_header_size + native.elf_phentry_size) // e_entry
+	// entrypoint
+	g.entry_pos64 = g.buf.len
+	mut phnum := if native.want_interp { 2 } else { 1 }
+	g.write64(native.segment_start + native.elf_header_size + (native.elf_phentry_size * phnum)) // e_entry
 	g.write64(native.elf_header_size) // e_phoff
 	g.write64(0) // e_shoff
 	g.write32(0) // e_flags
 	g.write16(native.elf_header_size)
 	g.write16(native.elf_phentry_size)
-	g.write16(1) // e_phnum
+	g.phnum_pos = g.buf.len
+	g.write16(phnum) // e_phnum
 	g.write16(0) // e_shentsize
 	// e_shnum := g.buf.len
 	g.write16(0) // e_shnum (number of sections)
 	g.write16(0) // e_shstrndx
+/*
+	g.file_size_pos = g.elf_phdr(1, 5, 0, native.segment_start, 0, 0x1000)
+	g.interp_pos = g.elf_phdr(3, 4, 0, 0, 0, 1)
+*/
 	// Elf64_Phdr
 	g.write32(1) // p_type
 	g.write32(5) // p_flags
@@ -92,6 +101,38 @@ pub fn (mut g Gen) generate_elf_header() {
 	g.write64(0) // p_filesz PLACEHOLDER, set to file_size later // addr: 060
 	g.write64(0) // p_memsz
 	g.write64(0x1000) // p_align
+
+	if native.want_interp {
+		// Elf64_Phdr (56 bytes)
+		// at := 0xfe
+		g.write32(3) // p_type
+		g.write32(4) // p_flags
+		g.interp_pos = i64(g.buf.len)
+		g.write64(native.placeholder) // p_offset
+		g.write64(native.placeholder) // p_vaddr addr:050
+		g.write64(native.placeholder) //
+		// g.interp_pos = i64(g.buf.len)
+		g.write64(native.placeholder) // p_filesz PLACEHOLDER, set to file_size later // addr: 060
+		g.write64(native.placeholder) // p_memsz
+		g.write64(1) // p_align
+	}
+
+	// nbytes with data
+
+	/*
+	// Elf64_Phdr (56 bytes)
+	g.write32(2) // p_type
+	g.write32(6) // p_flags
+	g.write64(0) // p_offset
+	g.write64(native.segment_start) // p_vaddr addr:050
+	g.write64(native.segment_start) //
+	g.file_size_pos = i64(g.buf.len)
+	g.write64(0) // p_filesz PLACEHOLDER, set to file_size later // addr: 060
+	g.write64(0) // p_memsz
+	g.write64(0x1000) // p_align
+	*/
+	// nbytes with data
+
 	// write sections
 	/*
 	sections := []string{}
@@ -123,6 +164,9 @@ fn (mut g Gen) elf_string_table() {
 			.rel32 {
 				g.write32_at(s.pos, g.buf.len - s.pos - 4)
 			}
+			.nop {
+				// do nothing
+			}
 			else {
 				g.n_error('unsupported string reloc type')
 			}
@@ -131,7 +175,22 @@ fn (mut g Gen) elf_string_table() {
 	}
 }
 
+fn (mut g Gen) generate_elf_interp(path string) {
+	v := g.allocate_string(path, 0, .nop) + 4
+	g.write64_at(g.interp_pos, v)
+	g.write64_at(g.interp_pos + 8, v)
+	g.write64_at(g.interp_pos + 16, v)
+	l := path.len
+	g.write64_at(g.interp_pos + 24, l)
+	g.write64_at(g.interp_pos + 32, l)
+}
+
 pub fn (mut g Gen) generate_elf_footer() {
+	if native.want_interp {
+		// g.generate_elf_interp('/lib/ld-linux.so.2')
+		g.generate_elf_interp('/lib64/ld-linux-x86-64.so.2')
+		// requires dynamic section
+	}
 	g.elf_string_table()
 	// file_size holds the address at the end of the code and const strings table
 	file_size := g.buf.len
