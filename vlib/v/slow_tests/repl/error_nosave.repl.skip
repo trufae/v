@@ -2,8 +2,8 @@ a
 33
 ===output===
 error: undefined ident: `a`
-    5 | import math
-    6 | 
-    7 | println(a)
+    2 | import math
+    3 | 
+    4 | println(a)
       |         ^
 33

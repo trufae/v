@@ -4,4 +4,4 @@ builder error: bad module definition: .entire_commented_module.repl.vrepl_temp.v
     1 | import v.slow_tests.modules.acommentedmodule
       | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     2 | import os
-    3 |
+    3 | import time
