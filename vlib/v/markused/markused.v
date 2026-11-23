@@ -780,6 +780,7 @@ fn mark_used_with_test_files(a &flat.FlatAst, tc &types.TypeChecker, test_files 
 		}
 		auto_str_skipped_fields:          auto_str_skipped_fields
 		detect_generics:                  detect_reachable_generics
+		checked_local_types:              tc.semantic_type_id(types.Type(types.Void{})) != none
 		body_checker_edges_authoritative: use_prepared && !detect_reachable_generics
 		alias_suffixes:                   markused_alias_name_suffixes(tc)
 		alias_suffix_count:               tc.type_aliases.ids.len
@@ -3066,8 +3067,7 @@ struct CallCollector {
 	local_ident_visibility           map[int]bool
 	local_ident_types                flat.NodeTypeTextBindings
 	local_type_texts                 &flat.TypeTextTable = &flat.TypeTextTable{}
-	checked_local_names              map[string]bool
-	checked_sum_types                map[string]types.TypeId
+	checked_local_types              bool
 	has_local_ident_visibility       bool
 	detect_generics                  bool
 	body_checker_edges_authoritative bool
@@ -6249,21 +6249,8 @@ fn (c &CallCollector) collect_body_with_generic_detection(node &flat.Node, cur_m
 	local_values, has_inference_binders := c.local_value_names(node)
 	visibility_names := c.local_value_visibility_names(local_values, cur_module, imports)
 	needs_visibility := visibility_names.len > 0
-	mut local_types := c.new_local_types()
-	mut local_ident_types := c.new_ident_types()
-	mut checked_local_names := map[string]bool{}
-	mut checked_sum_types := map[string]types.TypeId{}
-	mut inferred_visible_idents := map[int]bool{}
-	if checked := c.checked_local_bindings(node, cur_module, imports, local_values) {
-		local_types = checked.type_names
-		checked_local_names = checked.ident_names
-		checked_sum_types = checked.sum_types
-		if needs_visibility {
-			inferred_visible_idents = markused_visible_local_idents(c.a, node, visibility_names)
-		}
-	} else {
-		_, local_types, local_ident_types, inferred_visible_idents = c.local_value_info_for_names(node, cur_module, imports, local_values, visibility_names, has_inference_binders)
-	}
+	_, mut local_types, local_ident_types, inferred_visible_idents := c.local_value_info_for_names(node,
+		cur_module, imports, local_values, visibility_names, has_inference_binders)
 	if receiver_name.len > 0 && receiver_struct != 0 {
 		local_types.set_id(receiver_name, receiver_struct)
 	}
@@ -6283,8 +6270,6 @@ fn (c &CallCollector) collect_body_with_generic_detection(node &flat.Node, cur_m
 		...c
 		local_ident_visibility:     visible_local_idents
 		local_ident_types:          local_ident_types
-		checked_local_names:        checked_local_names
-		checked_sum_types:          checked_sum_types
 		has_local_ident_visibility: true
 	}
 	result.uses_generics = scoped.collect_calls_with_locals_and_generics(node, cur_module, imports, receiver_name, receiver_struct, local_values, local_types, visible_local_idents, c.body_checker_edges_authoritative, detect_generics, result.uses_generics, mut result.calls, mut result.refs, true)
@@ -6335,6 +6320,7 @@ fn (c &CallCollector) fork_with_tc(wtc &types.TypeChecker) CallCollector {
 		generic_calls:                    c.generic_calls
 		auto_str_skipped_fields:          c.auto_str_skipped_fields
 		detect_generics:                  c.detect_generics
+		checked_local_types:              c.checked_local_types
 		body_checker_edges_authoritative: c.body_checker_edges_authoritative
 		alias_suffixes:                   c.alias_suffixes
 		alias_suffix_count:               c.alias_suffix_count
@@ -6974,202 +6960,15 @@ fn (c &CallCollector) local_value_info(node &flat.Node, cur_module string, impor
 	return names, type_names, ident_types
 }
 
-struct CheckedLocalBindings {
-mut:
-	type_names  flat.TypeTextBindings
-	ident_names map[string]bool
-	sum_types   map[string]types.TypeId
-}
-
-// Checked bindings preserve the checker's lexical scopes without rebuilding
-// them. Sum receivers retain their declared type through narrowing. Nominal
-// aliases and unresolved generics retain the inference path, whose source
-// spellings carry information beyond a checked runtime type.
-@[direct_array_access]
-fn (c &CallCollector) checked_local_bindings(root &flat.Node, cur_module string, imports map[string]string, names map[string]bool) ?CheckedLocalBindings {
-	if root.kind != .fn_decl || c.generic_fn_name_is_known(root.value, cur_module) {
-		return none
-	}
-	params := c.tc.fn_param_types[qualify_fn(cur_module, root.value)] or { return none }
-	for typ in params {
-		if !markused_checked_local_type(typ) {
-			return none
-		}
-	}
-	mut result := CheckedLocalBindings{
-		type_names:  c.new_local_types()
-		ident_names: names
-	}
-	mut ident_names_owned := false
-	mut bindings := map[string]bool{}
-	mut param_index := 0
-	for i in 0 .. root.children_count {
-		param := c.a.child_node(root, i)
-		if param.kind != .param || param.value.len == 0 { continue }
-		bindings[param.value] = true
-		result.type_names.set_id(param.value, u32(0))
-		if param_index < params.len && markused_direct_sum_type(params[param_index]) {
-			result.sum_types[param.value] = c.tc.semantic_type_id(params[param_index]) or { return none }
-			result.type_names.set_id(param.value, c.tc.type_name_by_id(result.sum_types[param.value]))
-		}
-		param_index++
-	}
-	if param_index != params.len { return none }
-	mut first_local_read := flat.empty_node
-	mut scratch := c.local_walk_scratch
-	mut stack := MarkusedNodeStack{
-		nodes: if !isnil(scratch) {
-			scratch.nodes
-		} else {
-			[]flat.NodeId{cap: int(root.children_count)}
-		}
-	}
-	defer {
-		if !isnil(scratch) { scratch.nodes = stack.nodes }
-	}
-	mut loop_names := map[string]bool{}
-	for i in 0 .. root.children_count {
-		id := c.a.child(root, i)
-		if int(id) >= 0 {
-			stack.push(id)
-		}
-	}
-	for stack.size > 0 {
-		raw_id := stack.pop()
-		outer := int(raw_id) >= 0
-		id := if outer { raw_id } else { flat.NodeId(-int(raw_id) - 1) }
-		node := c.a.node(id)
-		if node.kind in [.fn_decl, .c_fn_decl] {
-			continue
-		}
-		if node.kind in [.lambda_expr, .fn_literal] {
-			return none
-		}
-		if node.kind == .for_in_stmt {
-			for i in 0 .. 2 {
-				binding_id := c.a.child(node, i)
-				binding := c.a.node(binding_id)
-				if int(binding_id) < 0 || binding.kind != .ident
-					|| binding.value in ['', '_'] {
-					continue
-				}
-				typ := c.tc.expr_type(binding_id) or { return none }
-				if !markused_checked_local_type(typ) {
-					return none
-				}
-				if markused_direct_sum_type(typ) {
-					if binding.value in bindings { return none }
-					result.sum_types[binding.value] = c.tc.semantic_type_id(typ) or { return none }
-				} else if binding.value in result.sum_types {
-					return none
-				}
-				bindings[binding.value] = true
-				loop_names[binding.value] = true
-				if !result.ident_names[binding.value] {
-					if !ident_names_owned {
-						result.ident_names = result.ident_names.clone()
-						ident_names_owned = true
-					}
-					result.ident_names[binding.value] = true
-				}
-			}
-		}
-		if node.kind == .call {
-			if name := c.tc.resolved_call_name(id) {
-				if c.generic_fn_name_is_known(name, cur_module) {
-					return none
-				}
-			}
-		}
-		if node.kind == .decl_assign {
-			if node.typ != 0 {
-				if _ := c.contextual_alias_type_name(node.typ, cur_module, imports) {
-					return none
-				}
-			}
-			lhs_count := markused_assign_lhs_count(node)
-			rhs_count := int(node.children_count) - lhs_count
-			for i in 0 .. lhs_count {
-				lhs_index := if i < rhs_count { i * 2 } else { rhs_count + i }
-				lhs_id := c.a.child(node, lhs_index)
-				lhs := c.a.node(lhs_id)
-				if lhs.kind != .ident || lhs.value in ['', '_'] {
-					continue
-				}
-				typ := c.tc.expr_type(lhs_id) or { return none }
-				if !markused_checked_local_type(typ) {
-					return none
-				}
-				if markused_direct_sum_type(typ) {
-					if lhs.value in bindings { return none }
-					result.sum_types[lhs.value] = c.tc.semantic_type_id(typ) or { return none }
-				} else if lhs.value in result.sum_types {
-					return none
-				}
-				bindings[lhs.value] = true
-				if outer {
-					if result.type_names.contains(lhs.value) {
-						return none
-					}
-					result.type_names.set_id(lhs.value, if declared := result.sum_types[lhs.value] {
-						c.tc.type_name_by_id(declared)
-					} else {
-						u32(0)
-					})
-				}
-			}
-			for i in 0 .. rhs_count {
-				rhs_index := if i < lhs_count { i * 2 + 1 } else { lhs_count + i }
-				if _ := c.syntax_alias_expr_type(c.a.child(node, rhs_index), cur_module, imports) {
-					return none
-				}
-			}
-		}
-		if node.kind == .ident && (node.value in names || node.value in loop_names) {
-			if int(first_local_read) < 0 { first_local_read = id }
-			typ := c.tc.expr_type(id) or { return none }
-			if !markused_checked_local_type(typ) {
-				return none
-			}
-		}
-		for i in 0 .. node.children_count {
-			child_id := c.a.child(node, i)
-			if int(child_id) < 0 {
-				continue
-			}
-			child := c.a.node(child_id)
-			inner := child.kind in [.block, .if_expr, .match_stmt, .match_branch, .select_stmt,
-				.select_branch, .for_stmt, .for_in_stmt, .fn_literal, .comptime_if, .comptime_for,
-				.defer_stmt, .lock_expr] || node.kind == .decl_assign
-			stack.push(if outer && !inner {
-				child_id
-			} else {
-				flat.NodeId(-int(child_id) - 1)
-			})
-		}
-	}
-	// Manually constructed checker views without an interner retain the
-	// spelling-based fallback. Checked bodies otherwise format only queried types.
-	if int(first_local_read) >= 0 {
-		if _ := c.tc.checked_expr_type_id(first_local_read) {
-		} else {
-			return none
-		}
-	}
-	return result
-}
-
-// Intern only receiver types actually queried by call collection. Validation
-// reads the recorded semantic types directly instead of interning every local
-// identifier in a body that may subsequently require the inference fallback.
+// Checked types are queried only where call collection needs them. The scope
+// walk retains source spellings when they differ, including narrowed sums.
 fn (c &CallCollector) checked_local_type_id(id flat.NodeId) ?types.TypeId {
-	if c.checked_local_names.len == 0 || c.a.node(id).value !in c.checked_local_names {
+	if !c.checked_local_types {
 		return none
 	}
-	if c.checked_sum_types.len > 0 {
-		if declared := c.checked_sum_types[c.a.node(id).value] {
-			return declared
-		}
+	typ := c.tc.expr_type(id) or { return none }
+	if typ is types.Void || markused_type_has_unknown(typ) {
+		return none
 	}
 	return c.tc.checked_expr_type_id(id)
 }
@@ -7177,41 +6976,6 @@ fn (c &CallCollector) checked_local_type_id(id flat.NodeId) ?types.TypeId {
 fn (c &CallCollector) checked_local_type_name(id flat.NodeId) ?u32 {
 	type_id := c.checked_local_type_id(id) or { return none }
 	return c.tc.type_name_by_id(type_id)
-}
-
-fn markused_checked_local_type(typ types.Type) bool {
-	match typ {
-		types.Unknown, types.Alias, types.Interface { return false }
-		types.Pointer, types.OptionType, types.ResultType {
-			return markused_checked_local_type(typ.base_type)
-		}
-		types.Array, types.ArrayFixed, types.Channel {
-			return markused_checked_local_type(typ.elem_type)
-		}
-		types.Map {
-			return markused_checked_local_type(typ.key_type)
-				&& markused_checked_local_type(typ.value_type)
-		}
-		types.FnType {
-			if !markused_checked_local_type(typ.return_type) {
-				return false
-			}
-			for param in typ.params {
-				if !markused_checked_local_type(param.typ) {
-					return false
-				}
-			}
-		}
-		types.MultiReturn {
-			for part in typ.types {
-				if !markused_checked_local_type(part) {
-					return false
-				}
-			}
-		}
-		else {}
-	}
-	return true
 }
 
 fn markused_direct_sum_type(typ types.Type) bool {
@@ -7402,6 +7166,18 @@ fn markused_restore_local_types(mark int, mut type_names flat.TypeTextBindings, 
 	}
 }
 
+fn (c &CallCollector) remember_local_ident_type(id flat.NodeId, source_type u32, mut ident_types flat.NodeTypeTextBindings) {
+	if c.checked_local_types {
+		if recorded := c.tc.expr_type(id) {
+			if !markused_type_has_unknown(recorded) && !markused_direct_sum_type(recorded)
+				&& recorded.source_type_id() == source_type {
+				return
+			}
+		}
+	}
+	ident_types.set_id(int(id), source_type)
+}
+
 fn (c &CallCollector) infer_local_type_bindings(node &flat.Node, cur_module string, imports map[string]string, names map[string]bool, mut type_names flat.TypeTextBindings, mut ident_types flat.NodeTypeTextBindings, root bool) {
 	mut changes := []LocalTypeChange{}
 	mut name_state := LocalNameState{ names: names }
@@ -7505,7 +7281,7 @@ fn (c &CallCollector) infer_local_type_bindings_scoped(node &flat.Node, cur_modu
 					}
 					if rhs.kind == .ident {
 						if typ_source_id := type_names.type_id(rhs.value) {
-							ident_types.set_id(int(rhs_id), typ_source_id)
+							c.remember_local_ident_type(rhs_id, typ_source_id, mut ident_types)
 						}
 					}
 				}
@@ -7550,7 +7326,7 @@ fn (c &CallCollector) infer_local_type_bindings_scoped(node &flat.Node, cur_modu
 		}
 		if child.kind == .ident {
 			if typ_source_id := type_names.type_id(child.value) {
-				ident_types.set_id(int(id), typ_source_id)
+				c.remember_local_ident_type(id, typ_source_id, mut ident_types)
 			}
 		}
 		if child.children_count > 0 {
@@ -10048,9 +9824,17 @@ fn (c &CallCollector) operator_lhs_type(lhs_id flat.NodeId, local_types flat.Typ
 	if int(lhs_id) >= 0 {
 		lhs := c.a.node(lhs_id)
 		if lhs.kind == .ident {
-			if lhs.value in c.checked_local_names && lhs.value !in c.checked_sum_types {
+			if scoped_type := c.local_ident_types.type_id(int(lhs_id)) {
+				typ := c.tc.parse_canonical_type(scoped_type)
+				if typ !is types.Unknown && typ !is types.Void {
+					return typ
+				}
+			}
+			if c.checked_local_types {
 				if recorded := c.tc.expr_type(lhs_id) {
-					return recorded
+					if recorded !is types.Void && !markused_type_has_unknown(recorded) {
+						return recorded
+					}
 				}
 			}
 			if local_type_source_id := local_types.type_id(lhs.value) {

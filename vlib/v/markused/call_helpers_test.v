@@ -2488,103 +2488,127 @@ fn test_join_path_helper_respects_import_aliases_and_local_bindings() {
 	}
 }
 
-fn test_checked_local_names_copy_only_when_a_loop_adds_a_name() {
-	for existing in [0, 1, 2] {
+fn test_local_type_overrides_preserve_aliases_and_declared_sums() {
+	for checked in [false, true] {
 		mut a := flat.FlatAst.new()
 		mut tc := types.TypeChecker.new(&a)
 		tc.parallel_check_sparse = true
-		tc.fn_param_types['checked_names'] = []types.Type{}
-		binding := a.add_val(.ident, 'value')
-		tc.sparse_expr_type_values[int(binding)] = types.Type(types.int_)
-		container := a.add_val(.ident, 'items')
-		loop := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [binding, flat.empty_node,
-			container])
-		body := call_helper_node(mut a, flat.Node{ kind: .block }, [loop])
-		fn_id := call_helper_node(mut a, flat.Node{ kind: .fn_decl, value: 'checked_names' }, [body])
-		names := if existing > 0 {
-			{
-				'value': existing == 2
-				'other': true
-			}
-		} else {
-			{
-				'other': true
-			}
+		ordinary := a.add_val(.ident, 'ordinary')
+		aliased := a.add_val(.ident, 'aliased')
+		narrowed := a.add_val(.ident, 'narrowed')
+		declared_sum := a.add_val(.ident, 'declared_sum')
+		bytes_id := flat.source_type_id('Bytes')
+		choice_id := flat.source_type_id('Choice')
+		tc.sparse_expr_type_values[int(ordinary)] = types.Type(types.int_)
+		tc.sparse_expr_type_values[int(aliased)] = types.Type(types.Array{ elem_type: types.new_type_reference(types.Type(types.u8_)) })
+		tc.sparse_expr_type_values[int(narrowed)] = types.Type(types.Struct{ name_id: flat.source_type_id('Variant') })
+		tc.sparse_expr_type_values[int(declared_sum)] = types.Type(types.SumType{ name_id: choice_id })
+		collector := CallCollector{ a: &a, tc: &tc, checked_local_types: checked }
+		mut ident_types := flat.NodeTypeTextBindings{}
+		collector.remember_local_ident_type(ordinary, flat.source_type_int, mut ident_types)
+		collector.remember_local_ident_type(aliased, bytes_id, mut ident_types)
+		collector.remember_local_ident_type(narrowed, choice_id, mut ident_types)
+		collector.remember_local_ident_type(declared_sum, choice_id, mut ident_types)
+		assert ident_types.contains(int(ordinary)) == !checked
+		for id in [aliased, narrowed, declared_sum] {
+			assert ident_types.contains(int(id))
 		}
-		collector := CallCollector{ a: &a, tc: &tc }
-		checked := collector.checked_local_bindings(a.node(fn_id), 'main', map[string]string{}, names) or {
-			panic('checked loop bindings must be supported')
+		scoped := CallCollector{ ...collector, local_ident_types: ident_types }
+		for id, expected in {
+			int(ordinary):     flat.source_type_int
+			int(aliased):      bytes_id
+			int(narrowed):     choice_id
+			int(declared_sum): choice_id
+		} {
+			assert scoped.receiver_type_name(flat.NodeId(id), 'main', map[string]string{},
+				map[string]bool{}, flat.TypeTextBindings{}) == expected
 		}
-		assert checked.ident_names['value'] && checked.ident_names['other']
-		assert names.len == if existing > 0 { 2 } else { 1 }
-		assert names['value'] == (existing == 2)
 	}
 }
 
 fn test_inference_name_copy_keeps_nested_and_sibling_loop_scopes_private() {
-	for original_value in [false, true] {
-		mut a := flat.FlatAst.new()
-		mut tc := types.TypeChecker.new(&a)
-		tc.parallel_check_sparse = true
-		outer_binding := a.add_val(.ident, 'value')
-		inner_binding := a.add_val(.ident, 'value')
-		sibling_binding := a.add_val(.ident, 'sibling')
-		for id, name in {
-			int(outer_binding):   'Outer'
-			int(inner_binding):   'Inner'
-			int(sibling_binding): 'Sibling'
-		} {
-			tc.sparse_expr_type_values[id] = types.Type(types.Struct{ name_id: flat.source_type_id(name) })
+	for checked in [false, true] {
+		for original_value in [false, true] {
+			mut a := flat.FlatAst.new()
+			mut tc := types.TypeChecker.new(&a)
+			tc.parallel_check_sparse = true
+			outer_binding := a.add_val(.ident, 'value')
+			inner_binding := a.add_val(.ident, 'value')
+			sibling_binding := a.add_val(.ident, 'sibling')
+			for id, name in {
+				int(outer_binding):   'Outer'
+				int(inner_binding):   'Inner'
+				int(sibling_binding): 'Sibling'
+			} {
+				tc.sparse_expr_type_values[id] = types.Type(types.Struct{ name_id: flat.source_type_id(name) })
+			}
+			container := a.add_val(.ident, 'items')
+			inner_use := a.add_val(.ident, 'value')
+			inner_body := call_helper_node(mut a, flat.Node{ kind: .block }, [inner_use])
+			inner := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [
+				inner_binding,
+				flat.empty_node,
+				container,
+				inner_body,
+			])
+			outer_after_inner := a.add_val(.ident, 'value')
+			outer_body := call_helper_node(mut a, flat.Node{ kind: .block }, [inner, outer_after_inner])
+			outer := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [
+				outer_binding,
+				flat.empty_node,
+				container,
+				outer_body,
+			])
+			sibling_use := a.add_val(.ident, 'sibling')
+			sibling_body := call_helper_node(mut a, flat.Node{ kind: .block }, [sibling_use])
+			sibling := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [
+				sibling_binding,
+				flat.empty_node,
+				container,
+				sibling_body,
+			])
+			after := a.add_val(.ident, 'value')
+			after_sibling := a.add_val(.ident, 'sibling')
+			root := call_helper_node(mut a, flat.Node{ kind: .block }, [outer, sibling, after,
+				after_sibling])
+			names := {
+				'value': original_value
+				'other': true
+			}
+			mut local_types := flat.TypeTextBindings.from_names({
+				'value': 'Before'
+			})
+			mut ident_types := flat.NodeTypeTextBindings{}
+			if checked {
+				for id, name in {
+					int(inner_use):         'Inner'
+					int(outer_after_inner): 'Outer'
+					int(sibling_use):       'Sibling'
+					int(after):             'Before'
+				} {
+					tc.sparse_expr_type_values[id] = types.Type(types.Struct{ name_id: flat.source_type_id(name) })
+				}
+			}
+			collector := CallCollector{ a: &a, tc: &tc, checked_local_types: checked }
+			collector.infer_local_type_bindings(a.node(root), 'main', map[string]string{}, names, mut local_types, mut ident_types, false)
+			assert names == {
+				'value': original_value
+				'other': true
+			}
+			assert local_types.value('value') == 'Before'
+			assert !local_types.contains('sibling')
+			assert ident_types.contains(int(inner_use)) == !checked
+			scoped := CallCollector{ ...collector, local_ident_types: ident_types }
+			for id, expected in {
+				int(inner_use):         'Inner'
+				int(outer_after_inner): 'Outer'
+				int(sibling_use):       'Sibling'
+				int(after):             'Before'
+				int(after_sibling):     ''
+			} {
+				actual := scoped.receiver_type_name(flat.NodeId(id), 'main', map[string]string{}, names, local_types)
+				assert flat.source_type_name(actual) == expected
+			}
 		}
-		container := a.add_val(.ident, 'items')
-		inner_use := a.add_val(.ident, 'value')
-		inner_body := call_helper_node(mut a, flat.Node{ kind: .block }, [inner_use])
-		inner := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [
-			inner_binding,
-			flat.empty_node,
-			container,
-			inner_body,
-		])
-		outer_after_inner := a.add_val(.ident, 'value')
-		outer_body := call_helper_node(mut a, flat.Node{ kind: .block }, [inner, outer_after_inner])
-		outer := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [
-			outer_binding,
-			flat.empty_node,
-			container,
-			outer_body,
-		])
-		sibling_use := a.add_val(.ident, 'sibling')
-		sibling_body := call_helper_node(mut a, flat.Node{ kind: .block }, [sibling_use])
-		sibling := call_helper_node(mut a, flat.Node{ kind: .for_in_stmt }, [
-			sibling_binding,
-			flat.empty_node,
-			container,
-			sibling_body,
-		])
-		after := a.add_val(.ident, 'value')
-		after_sibling := a.add_val(.ident, 'sibling')
-		root := call_helper_node(mut a, flat.Node{ kind: .block }, [outer, sibling, after,
-			after_sibling])
-		names := {
-			'value': original_value
-			'other': true
-		}
-		mut local_types := flat.TypeTextBindings.from_names({
-			'value': 'Before'
-		})
-		mut ident_types := flat.NodeTypeTextBindings{}
-		collector := CallCollector{ a: &a, tc: &tc }
-		collector.infer_local_type_bindings(a.node(root), 'main', map[string]string{}, names, mut local_types, mut ident_types, false)
-		assert names == {
-			'value': original_value
-			'other': true
-		}
-		assert local_types.value('value') == 'Before'
-		assert !local_types.contains('sibling')
-		assert ident_types.value(int(inner_use)) == 'Inner'
-		assert ident_types.value(int(outer_after_inner)) == 'Outer'
-		assert ident_types.value(int(sibling_use)) == 'Sibling'
-		assert ident_types.value(int(after)) == 'Before'
-		assert ident_types.value(int(after_sibling)) == ''
 	}
 }
